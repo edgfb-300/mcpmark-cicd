@@ -1,0 +1,254 @@
+name: Pull Request Automation Workflow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint checks
+        id: eslint
+        run: |
+          npm run lint 2>&1 | tee eslint-results.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Run Prettier formatting checks
+        id: prettier
+        run: |
+          npx prettier --check . 2>&1 | tee prettier-results.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Post Code Quality Report as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs').promises;
+            const [eslintResults, prettierResults] = await Promise.all([
+              fs.readFile('eslint-results.txt', 'utf8').catch(() => 'No ESLint results found'),
+              fs.readFile('prettier-results.txt', 'utf8').catch(() => 'No Prettier results found')
+            ]);
+
+            const commentBody = `
+## Code Quality Report
+### ESLint Results
+\`\`\`
+${eslintResults}
+\`\`\`
+
+### Prettier Results
+\`\`\`
+${prettierResults}
+\`\`\`
+`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test suite with coverage
+        id: test
+        run: |
+          npm test -- --coverage 2>&1 | tee test-coverage.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Post Test Coverage Report as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs').promises;
+            const coverageResults = await fs.readFile('test-coverage.txt', 'utf8').catch(() => 'No test coverage results found');
+
+            const commentBody = `
+## Test Coverage Report
+\`\`\`
+${coverageResults}
+\`\`\`
+`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-coverage-report
+          path: |
+            ./coverage/
+            test-coverage.txt
+          if-no-files-found: warn
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability check (npm audit)
+        id: npm-audit
+        run: |
+          npm audit --audit-level=moderate 2>&1 | tee npm-audit-results.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Scan for secrets in code changes
+        uses: trufflesecurity/trufflehog@v3.65.0
+        with:
+          path: .
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          output: trufflehog-results.txt
+
+      - name: Post Security Scan Report as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs').promises;
+            const [vulnResults, secretResults] = await Promise.all([
+              fs.readFile('npm-audit-results.txt', 'utf8').catch(() => 'No dependency vulnerability results found'),
+              fs.readFile('trufflehog-results.txt', 'utf8').catch(() => 'No secret scan results found')
+            ]);
+
+            const commentBody = `
+## Security Scan Report
+### Dependencies Vulnerabilities
+\`\`\`
+${vulnResults}
+\`\`\`
+
+### Secret Scan Results
+\`\`\`
+${secretResults}
+\`\`\`
+`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: |
+          npm run build 2>&1 | tee build-results.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Validate endpoints (basic health check)
+        id: endpoint-check
+        run: |
+          # Start application in background
+          npm start &
+          APP_PID=$!
+
+          # Wait for application to start
+          sleep 10
+
+          # Run basic endpoint checks
+          echo "Checking application endpoints..."
+          curl -s -o /dev/null -w "Health endpoint: %{http_code}\n" http://localhost:3000/health || echo "Health endpoint unreachable"
+          curl -s -o /dev/null -w "Root endpoint: %{http_code}\n" http://localhost:3000/ || echo "Root endpoint unreachable"
+
+          # Clean up
+          kill $APP_PID 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Create deployment preview artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            ./dist/
+            build-results.txt
+          if-no-files-found: warn
+
+      - name: Post Build Validation status as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs').promises;
+            const buildResults = await fs.readFile('build-results.txt', 'utf8').catch(() => 'No build results found');
+            const endpointLogs = `${{ steps.endpoint-check.outputs.stdout || 'No endpoint check logs available' }}`;
+
+            const commentBody = `
+## Build Validation
+### Build Results
+\`\`\`
+${buildResults}
+\`\`\`
+
+### Endpoint Validation Results
+\`\`\`
+${endpointLogs}
+\`\`\`
+`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
